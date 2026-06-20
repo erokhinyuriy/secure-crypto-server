@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using NSec.Cryptography;
+using SecureCryptoServer.Dtos;
 using SecureCryptoServer.Entities;
 using SecureCryptoServer.Persistence;
 
@@ -31,27 +32,36 @@ var ActiveConnections = new System.Collections.Concurrent.ConcurrentDictionary<s
 // 1. HTTP API: Регистрация нового пользователя и его публичного ключа Ed25519
 app.MapPost("/api/auth/register", async (RegisterDto request, MessengerDbContext db) =>
 {
-    if (string.IsNullOrWhiteSpace(request.Username) || string.IsNullOrWhiteSpace(request.PublicKeyBase64))
-        return Results.BadRequest("Неверные параметры.");
+    if (string.IsNullOrWhiteSpace(request.Username) ||
+        string.IsNullOrWhiteSpace(request.PublicKeyBase64) ||
+        string.IsNullOrWhiteSpace(request.EcdhIdentityKeyBase64) ||
+        string.IsNullOrWhiteSpace(request.SignedPrekeyBase64) ||
+        string.IsNullOrWhiteSpace(request.OneTimePrekeyBase64))
+    {
+        return Results.BadRequest("Неверные параметры. Переданы не все криптографические ключи.");
+    }
 
     var normalizedUsername = request.Username.ToLower().Trim();
 
-    // Асинхронно проверяем, занято ли имя
     var userExists = await db.Users.AnyAsync(u => u.Username == normalizedUsername);
     if (userExists)
         return Results.Conflict("Имя пользователя уже занято.");
 
+    // Записываем устройство со всеми эллиптическими ключами в SQLite
     var newDevice = new UserDevice
     {
         Username = normalizedUsername,
-        PublicKeyBase64 = request.PublicKeyBase64
+        PublicKeyBase64 = request.PublicKeyBase64,
+        EcdhIdentityKeyBase64 = request.EcdhIdentityKeyBase64,
+        SignedPrekeyBase64 = request.SignedPrekeyBase64,
+        OneTimePrekeyBase64 = request.OneTimePrekeyBase64
     };
 
     db.Users.Add(newDevice);
     await db.SaveChangesAsync();
 
-    Console.WriteLine($"[БД] Зарегистрирован пользователь: {normalizedUsername}");
-    return Results.Ok(new { message = "Регистрация успешна." });
+    Console.WriteLine($"[X3DH] Успешно зарегистрирован профиль безопасности для: {normalizedUsername}");
+    return Results.Ok(new { message = "Регистрация X3DH успешна." });
 });
 
 // 2. WEBSOCKET: Хост-фильтр для обмена сообщениями с проверкой Ed25519-подписи
@@ -182,6 +192,28 @@ app.Map("/ws", async (HttpContext context, IServiceScopeFactory scopeFactory) =>
     }
 });
 
+// Эндпоинт для протокола X3DH: возвращает набор ключей собеседника для начала чата
+app.MapGet("/api/crypto/prekey-bundle/{username}", async (string username, MessengerDbContext db) =>
+{
+    var targetUser = username.ToLower().Trim();
+    var device = await db.Users.FirstOrDefaultAsync(u => u.Username == targetUser);
+
+    if (device == null) return Results.NotFound("Пользователь не найден.");
+
+    var bundle = new PrekeyBundleDto(
+        device.Username,
+        device.PublicKeyBase64,          // Ed25519 Identity
+        device.EcdhIdentityKeyBase64,    // ECDH Identity
+        device.SignedPrekeyBase64,       // ECDH Signed Prekey
+        device.OneTimePrekeyBase64       // ECDH One-Time Prekey
+    );
+
+    // В настоящем Signal после выдачи OneTimePrekey он стирается из базы (одноразовый).
+    // Для MVP оставим его постоянным, чтобы не усложнять логику пополнения ключей.
+
+    return Results.Ok(bundle);
+});
+
 app.Run();
 
 // --- СЛУЖЕБНЫЕ МЕТОДЫ И DTO ---
@@ -218,8 +250,6 @@ bool VerifyPacketSignature(SignedPacket packet, string publicKeyBase64)
         return false;
     }
 }
-
-public record RegisterDto(string Username, string PublicKeyBase64);
 
 public class SignedPacket
 {
