@@ -180,7 +180,7 @@ app.Map("/ws", async (HttpContext context, IServiceScopeFactory scopeFactory) =>
             else if (packet.Type == "GROUP_MESSAGE" && !string.IsNullOrEmpty(packet.Recipient))
             {
                 var groupNameTarget = packet.Recipient.Trim();
-                var cleanGroupName = groupNameTarget.Replace("Группа:", "").Replace("Группа", "").Trim();
+                var cleanGroupName = groupNameTarget.Replace("Группа:", "").Replace("группа:", "").Trim();
 
                 using (var scope = scopeFactory.CreateScope())
                 {
