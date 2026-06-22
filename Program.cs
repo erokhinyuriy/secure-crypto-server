@@ -36,6 +36,7 @@ app.MapPost("/api/auth/register", async (RegisterDto request, MessengerDbContext
         string.IsNullOrWhiteSpace(request.PublicKeyBase64) ||
         string.IsNullOrWhiteSpace(request.EcdhIdentityKeyBase64) ||
         string.IsNullOrWhiteSpace(request.SignedPrekeyBase64) ||
+        string.IsNullOrWhiteSpace(request.SignedPrekeySignatureBase64) ||
         string.IsNullOrWhiteSpace(request.OneTimePrekeyBase64))
     {
         return Results.BadRequest("Неверные параметры. Переданы не все криптографические ключи.");
@@ -47,6 +48,16 @@ app.MapPost("/api/auth/register", async (RegisterDto request, MessengerDbContext
     if (userExists)
         return Results.Conflict("Имя пользователя уже занято.");
 
+    // САНИТИ-ПРОВЕРКА: убеждаемся, что SignedPrekeySignature реально является
+    // валидной Ed25519-подписью над SignedPrekeyBase64, сделанной заявленным Identity-ключом.
+    // Это не основная защита (её обязан делать клиент-получатель при X3DH), но отсекает
+    // повреждённые/некорректные регистрации на входе, не давая им попасть в базу.
+    if (!VerifySignedPrekey(request.PublicKeyBase64, request.SignedPrekeyBase64, request.SignedPrekeySignatureBase64))
+    {
+        Console.WriteLine($"[⚠️ X3DH] Регистрация отклонена: подпись SignedPrekey не прошла проверку для {normalizedUsername}");
+        return Results.BadRequest("Подпись SignedPrekey недействительна.");
+    }
+
     // Записываем устройство со всеми эллиптическими ключами в SQLite
     var newDevice = new UserDevice
     {
@@ -54,6 +65,7 @@ app.MapPost("/api/auth/register", async (RegisterDto request, MessengerDbContext
         PublicKeyBase64 = request.PublicKeyBase64,
         EcdhIdentityKeyBase64 = request.EcdhIdentityKeyBase64,
         SignedPrekeyBase64 = request.SignedPrekeyBase64,
+        SignedPrekeySignatureBase64 = request.SignedPrekeySignatureBase64,
         OneTimePrekeyBase64 = request.OneTimePrekeyBase64
     };
 
@@ -186,8 +198,10 @@ app.Map("/ws", async (HttpContext context, IServiceScopeFactory scopeFactory) =>
                 {
                     var db = scope.ServiceProvider.GetRequiredService<MessengerDbContext>();
 
-                    // Находим комнату в базе SQLite по её названию
-                    var groupRoom = await db.Groups.FirstOrDefaultAsync(g => g.GroupName.ToLower() == cleanGroupName.ToLower());
+                    var groups = await db.Groups.ToListAsync();
+
+                    var groupRoom = groups.Where(g => g.GroupName.ToLower() == cleanGroupName.ToLower())
+                        .FirstOrDefault();
 
                     if (groupRoom != null)
                     {
@@ -281,10 +295,11 @@ app.MapGet("/api/crypto/prekey-bundle/{username}", async (string username, Messe
 
     var bundle = new PrekeyBundleDto(
         device.Username,
-        device.PublicKeyBase64,          // Ed25519 Identity
-        device.EcdhIdentityKeyBase64,    // ECDH Identity
-        device.SignedPrekeyBase64,       // ECDH Signed Prekey
-        device.OneTimePrekeyBase64       // ECDH One-Time Prekey
+        device.PublicKeyBase64,            // Ed25519 Identity
+        device.EcdhIdentityKeyBase64,      // ECDH Identity
+        device.SignedPrekeyBase64,         // ECDH Signed Prekey
+        device.SignedPrekeySignatureBase64, // Подпись над SignedPrekey — клиент ОБЯЗАН её проверить
+        device.OneTimePrekeyBase64         // ECDH One-Time Prekey
     );
 
     // В настоящем Signal после выдачи OneTimePrekey он стирается из базы (одноразовый).
@@ -339,6 +354,21 @@ using (var scope = app.Services.CreateScope())
 {
     var dbContext = scope.ServiceProvider.GetRequiredService<SecureCryptoServer.Persistence.MessengerDbContext>();
 
+    // ЖЕЛЕЗОБЕТОННЫЙ SQL-ХУК для существующей базы:
+    // SQLite не поддерживает "ADD COLUMN IF NOT EXISTS", поэтому просто пытаемся
+    // добавить колонку и молча игнорируем ошибку, если она уже есть (свежая база,
+    // созданная через EnsureCreated() уже содержит её из модели).
+    try
+    {
+        dbContext.Database.ExecuteSqlRaw(
+            @"ALTER TABLE ""Users"" ADD COLUMN ""SignedPrekeySignatureBase64"" TEXT NULL DEFAULT '';");
+        Console.WriteLine("[Миграция] Колонка SignedPrekeySignatureBase64 добавлена в Users.");
+    }
+    catch (Exception)
+    {
+        // Колонка уже существует — это ожидаемо для свежих баз, ничего не делаем.
+    }
+
     // ЖЕЛЕЗОБЕТОННЫЙ SQL-ХУК:
     // Мы шлем прямой, чистый запрос в SQLite. 
     // Инструкция "IF NOT EXISTS" гарантирует, что таблица создастся ТОЛЬКО если её нет,
@@ -360,6 +390,28 @@ using (var scope = app.Services.CreateScope())
 app.Run();
 
 // --- СЛУЖЕБНЫЕ МЕТОДЫ И DTO ---
+
+// Проверка подписи SignedPrekey Ed25519-ключом identity.
+// Используется и сервером (как санити-чек при регистрации), и должна быть
+// продублирована на КЛИЕНТЕ при получении чужого PrekeyBundleDto перед X3DH.
+bool VerifySignedPrekey(string identityEd25519PublicKeyBase64, string signedPrekeyBase64, string signatureBase64)
+{
+    try
+    {
+        byte[] pubKeyBytes = Convert.FromBase64String(identityEd25519PublicKeyBase64);
+        byte[] prekeyBytes = Convert.FromBase64String(signedPrekeyBase64);
+        byte[] sigBytes = Convert.FromBase64String(signatureBase64);
+
+        var algorithm = SignatureAlgorithm.Ed25519;
+        var publicKey = PublicKey.Import(algorithm, pubKeyBytes, KeyBlobFormat.RawPublicKey);
+
+        return algorithm.Verify(publicKey, prekeyBytes, sigBytes);
+    }
+    catch
+    {
+        return false;
+    }
+}
 
 // Математическая верификация подписи Ed25519
 bool VerifyPacketSignature(SignedPacket packet, string publicKeyBase64)

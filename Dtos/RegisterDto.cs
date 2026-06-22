@@ -6,5 +6,6 @@ public record RegisterDto(
     string PublicKeyBase64,
     string EcdhIdentityKeyBase64,
     string SignedPrekeyBase64,
+    string SignedPrekeySignatureBase64, // Подпись Ed25519 над SignedPrekeyBase64
     string OneTimePrekeyBase64
 );

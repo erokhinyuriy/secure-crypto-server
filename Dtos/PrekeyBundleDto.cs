@@ -6,5 +6,6 @@ public record PrekeyBundleDto(
     string Ed25519PublicKey,
     string EcdhIdentityKey,
     string SignedPrekey,
+    string SignedPrekeySignature, // Клиент-получатель ОБЯЗАН проверить эту подпись перед использованием SignedPrekey
     string OneTimePrekey
 );

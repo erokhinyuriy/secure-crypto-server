@@ -13,6 +13,10 @@ public class UserDevice
     // Временный подписанный ECDH ключ (Signed Prekey)
     public string SignedPrekeyBase64 { get; set; } = "";
 
+    // НОВОЕ ПОЛЕ: подпись Ed25519 над SignedPrekeyBase64, сделанная Identity-ключом клиента.
+    // Без неё получатель бандла не может убедиться, что SignedPrekey не подменён сервером.
+    public string SignedPrekeySignatureBase64 { get; set; } = "";
+
     // Одноразовый ECDH ключ (One-Time Prekey)
     public string OneTimePrekeyBase64 { get; set; } = "";
 }
