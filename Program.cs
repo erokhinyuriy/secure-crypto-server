@@ -95,7 +95,10 @@ app.Map("/ws", async (HttpContext context, IServiceScopeFactory scopeFactory) =>
             if (result.MessageType == WebSocketMessageType.Close) break;
 
             var jsonString = Encoding.UTF8.GetString(buffer, 0, result.Count);
-            var packet = JsonSerializer.Deserialize<SignedPacket>(jsonString);
+            var packet = JsonSerializer.Deserialize<SignedPacket>(jsonString, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            });
             if (packet == null) continue;
 
             var senderName = packet.Sender.ToLower().Trim();
@@ -119,7 +122,7 @@ app.Map("/ws", async (HttpContext context, IServiceScopeFactory scopeFactory) =>
                 ActiveConnections[authenticatedUser] = webSocket;
                 Console.WriteLine($"[+] Сессия успешно верифицирована для: {authenticatedUser}");
 
-                // --- НОВАЯ ЛОГИКА: ВЫГРУЗКА ОФФЛАЙН СООБЩЕНИЙ ПРИ ВХОДЕ ---
+                // --- ВЫГРУЗКА ОФФЛАЙН СООБЩЕНИЙ ПРИ ВХОДЕ ---
                 using (var scope = scopeFactory.CreateScope())
                 {
                     var db = scope.ServiceProvider.GetRequiredService<MessengerDbContext>();
@@ -137,51 +140,127 @@ app.Map("/ws", async (HttpContext context, IServiceScopeFactory scopeFactory) =>
                             await webSocket.SendAsync(new ArraySegment<byte>(forwardData), WebSocketMessageType.Text, true, CancellationToken.None);
                         }
 
-                        // После успешной отправки очищаем очередь в SQLite, чтобы не дублировать
                         db.OfflineMessages.RemoveRange(offlineMsgs);
                         await db.SaveChangesAsync();
                         Console.WriteLine($"[Очередь] Очередь для {authenticatedUser} успешно очищена.");
                     }
                 }
-                // --------------------------------------------------------
             }
 
             if (packet.Type == "PING") continue;
 
+            // --- МАРШРУТ А: ТЕКСТОВЫЕ СООБЩЕНИЯ ТЕТ-А-ТЕТ ---
             if (packet.Type == "MESSAGE" && !string.IsNullOrEmpty(packet.Recipient))
             {
                 var recipient = packet.Recipient.ToLower().Trim();
 
                 if (ActiveConnections.TryGetValue(recipient, out var recipientSocket) && recipientSocket.State == WebSocketState.Open)
                 {
-                    // Получатель ОНЛАЙН: отправляем напрямую в сокет
                     var forwardData = Encoding.UTF8.GetBytes(jsonString);
                     await recipientSocket.SendAsync(new ArraySegment<byte>(forwardData), WebSocketMessageType.Text, true, CancellationToken.None);
                     Console.WriteLine($"[Сеть] Сообщение от {authenticatedUser} переслано к {recipient} (Онлайн)");
                 }
                 else
                 {
-                    // --- НОВАЯ ЛОГИКА: ПОЛУЧАТЕЛЬ ОФФЛАЙН -> СКЛАДЫВАЕМ В СЕЙФ СЕРВЕРА ---
                     using (var scope = scopeFactory.CreateScope())
                     {
                         var db = scope.ServiceProvider.GetRequiredService<MessengerDbContext>();
-
                         var offlineMessage = new OfflineMessage
                         {
                             Recipient = recipient,
-                            RawJsonPacket = jsonString // Храним зашифрованный пакет в исходном виде
+                            RawJsonPacket = jsonString
                         };
-
                         db.OfflineMessages.Add(offlineMessage);
                         await db.SaveChangesAsync();
                         Console.WriteLine($"[Сейф] Получатель {recipient} оффлайн. Сообщение сохранено в очередь SQLite.");
                     }
-                    // --------------------------------------------------------------------
                 }
             }
-        }
+            // --- МАРШРУТ В: МНОГОАДРЕСНОЕ ВЕЩАНИЕ ГРУППОВЫХ СООБЩЕНИЙ (ДОБАВЛЕНО) ---
+            else if (packet.Type == "GROUP_MESSAGE" && !string.IsNullOrEmpty(packet.Recipient))
+            {
+                var groupNameTarget = packet.Recipient.Trim();
+                var cleanGroupName = groupNameTarget.Replace("Группа:", "").Replace("Группа", "").Trim();
+
+                using (var scope = scopeFactory.CreateScope())
+                {
+                    var db = scope.ServiceProvider.GetRequiredService<MessengerDbContext>();
+
+                    // Находим комнату в базе SQLite по её названию
+                    var groupRoom = await db.Groups.FirstOrDefaultAsync(g => g.GroupName.ToLower() == cleanGroupName.ToLower());
+
+                    if (groupRoom != null)
+                    {
+                        // Извлекаем список участников ("alice,bob,charlie")
+                        var members = groupRoom.MembersRaw.Split(',', StringSplitOptions.RemoveEmptyEntries);
+
+                        foreach (var member in members)
+                        {
+                            // Не пересылаем сообщение обратно автору, у него оно уже отрисовалось
+                            if (member == senderName) continue;
+
+                            // Если участник группы сейчас в сети — мгновенно кидаем ему пакет в сокет!
+                            if (ActiveConnections.TryGetValue(member, out var memberSocket) && memberSocket.State == WebSocketState.Open)
+                            {
+                                var forwardData = Encoding.UTF8.GetBytes(jsonString);
+                                await memberSocket.SendAsync(new ArraySegment<byte>(forwardData), WebSocketMessageType.Text, true, CancellationToken.None);
+                            }
+                            else
+                            {
+                                // Если кто-то оффлайн — бережно откладываем в оффлайн-очередь SQLite
+                                var offlineMessage = new OfflineMessage
+                                {
+                                    Recipient = member,
+                                    RawJsonPacket = jsonString
+                                };
+                                db.OfflineMessages.Add(offlineMessage);
+                            }
+                        }
+
+                        await db.SaveChangesAsync();
+                        Console.WriteLine($"[Сервер Групп] Групповое сообщение от {senderName} успешно размножено для участников чата '{cleanGroupName}'.");
+                    }
+                }
+            }
+            // --- МАРШРУТ Б: РАССЫЛКА КЛЮЧЕЙ ГРУППЫ (ИСПРАВЛЕНО) ---
+            else if (packet.Type == "GROUP_KEY_DISTRIBUTION" && !string.IsNullOrEmpty(packet.Recipient))
+            {
+                var recipient = packet.Recipient.ToLower().Trim();
+
+                // ИСПРАВЛЕНО: Используем правильный словарь ActiveConnections из вашей ОЗУ-структуры
+                if (ActiveConnections.TryGetValue(recipient, out var recipientSocket) && recipientSocket.State == WebSocketState.Open)
+                {
+                    // Получатель в сети: пересылаем исходный крипто-пакет напрямую в его сокет
+                    // ИСПРАВЛЕНО: Заменили json на jsonString
+                    var forwardData = Encoding.UTF8.GetBytes(jsonString);
+                    await recipientSocket.SendAsync(new ArraySegment<byte>(forwardData), WebSocketMessageType.Text, true, CancellationToken.None);
+                    Console.WriteLine($"[Сеть Групп] Ключ группы от {authenticatedUser} успешно переслан к {recipient} (Онлайн)");
+                }
+                else
+                {
+                    // Получатель оффлайн: бережно складываем пакет ключей в общую очередь OfflineMessages
+                    // ИСПРАВЛЕНО: Адаптировали под вашу структуру полей SQLite (Recipient + RawJsonPacket)
+                    using (var scope = scopeFactory.CreateScope())
+                    {
+                        var db = scope.ServiceProvider.GetRequiredService<MessengerDbContext>();
+                        var offlineMessage = new OfflineMessage
+                        {
+                            Recipient = recipient,
+                            RawJsonPacket = jsonString // Упаковываем весь JSON пакета с ключом целиком
+                        };
+                        db.OfflineMessages.Add(offlineMessage);
+                        await db.SaveChangesAsync();
+                        Console.WriteLine($"[Сейф Групп] Получатель {recipient} оффлайн. Ключ группы сохранен в очередь SQLite.");
+                    }
+                }
+            }
+
+        } // Конец цикла while
     }
-    catch (Exception ex) { Console.WriteLine($"[-] Ошибка WebSocket: {ex.Message}"); }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[-] Ошибка WebSocket: {ex.Message}");
+    }
     finally
     {
         if (authenticatedUser != null) ActiveConnections.TryRemove(authenticatedUser, out _);
@@ -214,6 +293,70 @@ app.MapGet("/api/crypto/prekey-bundle/{username}", async (string username, Messe
     return Results.Ok(bundle);
 });
 
+#region Creation groups
+
+// --- МАРШРУТ 1: СОЗДАНИЕ ГРУППЫ (Minimal API) ---
+app.MapPost("/api/groups/create", async (GroupRoomDto dto, MessengerDbContext context) =>
+{
+    if (string.IsNullOrWhiteSpace(dto.GroupName) || dto.Members == null || dto.Members.Count == 0)
+    {
+        return Results.BadRequest("Некорректные данные группы");
+    }
+
+    // Принудительно добавляем создателя в список участников
+    var membersList = dto.Members.Select(m => m.ToLower().Trim()).ToList();
+    if (!membersList.Contains(dto.Creator.ToLower().Trim()))
+    {
+        membersList.Add(dto.Creator.ToLower().Trim());
+    }
+
+    var newGroup = new GroupRoom
+    {
+        GroupName = dto.GroupName,
+        Creator = dto.Creator,
+        MembersRaw = string.Join(",", membersList)
+    };
+
+    context.Groups.Add(newGroup);
+    await context.SaveChangesAsync();
+
+    return Results.Ok(new { GroupId = newGroup.Id, Message = "Группа зарегистрирована на сервере" });
+});
+
+// --- МАРШРУТ 2: ПОЛУЧЕНИЕ УЧАСТНИКОВ ГРУППЫ (Minimal API) ---
+app.MapGet("/api/groups/{groupId:guid}/members", async (Guid groupId, MessengerDbContext context) =>
+{
+    var group = await context.Groups.FindAsync(groupId);
+    if (group == null) return Results.NotFound("Группа не найдена");
+
+    var membersList = group.MembersRaw.Split(',', StringSplitOptions.RemoveEmptyEntries).ToList();
+    return Results.Ok(membersList);
+});
+
+#endregion
+
+using (var scope = app.Services.CreateScope())
+{
+    var dbContext = scope.ServiceProvider.GetRequiredService<SecureCryptoServer.Persistence.MessengerDbContext>();
+
+    // ЖЕЛЕЗОБЕТОННЫЙ SQL-ХУК:
+    // Мы шлем прямой, чистый запрос в SQLite. 
+    // Инструкция "IF NOT EXISTS" гарантирует, что таблица создастся ТОЛЬКО если её нет,
+    // и код НИКОГДА не вызовет ошибку "already exists", бережно сохраняя старых пользователей!
+    string sql = @"
+        CREATE TABLE IF NOT EXISTS ""Groups"" (
+            ""Id"" TEXT NOT NULL PRIMARY KEY,
+            ""GroupName"" TEXT NULL,
+            ""Creator"" TEXT NULL,
+            ""MembersRaw"" TEXT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS ""IX_Groups_Id"" ON ""Groups"" (""Id"");
+    ";
+
+    // Выполняем команду напрямую в обход движка миграций
+    dbContext.Database.ExecuteSqlRaw(sql);
+}
+
 app.Run();
 
 // --- СЛУЖЕБНЫЕ МЕТОДЫ И DTO ---
@@ -226,19 +369,16 @@ bool VerifyPacketSignature(SignedPacket packet, string publicKeyBase64)
         byte[] pubKeyBytes = Convert.FromBase64String(publicKeyBase64);
         byte[] sigBytes = Convert.FromBase64String(packet.Signature);
 
-        // ИСПРАВЛЕНО: Собираем строго стандартизированную строку данных для проверки
-        // (Берем только Sender, Recipient, Type и Payload)
-        var rawDataToVerify = new
-        {
-            s = packet.Sender.ToLower().Trim(),
-            r = packet.Recipient.ToLower().Trim(),
-            t = packet.Type,
-            p = packet.PayloadCipherBase64
-        };
+        // Приводим все строки к чистому, безопасному виду, страхуясь от null
+        string cleanSender = (packet.Sender ?? "").ToLower().Trim();
+        string cleanRecipient = (packet.Recipient ?? "").ToLower().Trim();
+        string cleanType = packet.Type ?? "";
+        string cleanPayload = packet.PayloadCipherBase64 ?? "";
 
-        // Переводим в чистый JSON-текст без пробелов (стандарт .NET)
-        string jsonToVerify = System.Text.Json.JsonSerializer.Serialize(rawDataToVerify);
-        byte[] messageBytes = Encoding.UTF8.GetBytes(jsonToVerify);
+        // ИСПРАВЛЕНО: Склеиваем строки в точно таком же формате, как на клиенте!
+        // Никакие JSON-настройки больше физически не смогут сломать крипто-подпись Ed25519.
+        string rawStringToVerify = $"{cleanSender}|{cleanRecipient}|{cleanType}|{cleanPayload}";
+        byte[] messageBytes = Encoding.UTF8.GetBytes(rawStringToVerify);
 
         var algorithm = SignatureAlgorithm.Ed25519;
         var publicKey = PublicKey.Import(algorithm, pubKeyBytes, KeyBlobFormat.RawPublicKey);
